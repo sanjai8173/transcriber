@@ -114,8 +114,8 @@ class WhisperProvider:
                 from faster_whisper import WhisperModel
                 # Use GPU if available, fall back to CPU
                 try:
-                    import torch
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    import ctranslate2
+                    device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
                 except ImportError:
                     device = "cpu"
 
@@ -160,10 +160,10 @@ class WhisperProvider:
         pcm_int16: bytes,
         session_id: str,
         audio_cursor_ms: int,
-        translate: bool = False,
+        task: str = "transcribe",
+        beam_size: int = 5,
     ) -> Optional[TranscriptionResult]:
         state = self._get_session(session_id)
-        state["translate"] = translate
 
         # Convert Int16 → Float32 normalized [-1, 1]
         samples = np.frombuffer(pcm_int16, dtype=np.int16).astype(np.float32) / 32768.0
@@ -192,26 +192,32 @@ class WhisperProvider:
         # Run Whisper in a thread pool (CPU-bound)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, self._run_whisper, state["pcm_f32"].copy(), state, audio_cursor_ms
+            None, self._run_whisper, state["pcm_f32"].copy(), state, audio_cursor_ms, task, beam_size
         )
         return result
 
-    def _run_whisper(self, audio: np.ndarray, state: dict, audio_cursor_ms: int) -> Optional[TranscriptionResult]:
+    def _run_whisper(
+        self,
+        audio: np.ndarray,
+        state: dict,
+        audio_cursor_ms: int,
+        task: str = "transcribe",
+        beam_size: int = 5,
+    ) -> Optional[TranscriptionResult]:
         try:
             with self._lock:
                 model = self._model
             if model is None:
                 return None
 
-            task_type = "translate" if state.get("translate") else "transcribe"
             segments, info = model.transcribe(
                 audio,
                 language=None,               # auto-detect
-                task=task_type,
+                task=task,
                 word_timestamps=True,        # essential for token-level output
                 vad_filter=True,             # skip silence
                 vad_parameters={"min_silence_duration_ms": 300},
-                beam_size=5,
+                beam_size=beam_size,
                 without_timestamps=False,
             )
 
@@ -268,7 +274,13 @@ class WhisperProvider:
             print(f"[Whisper] Transcription error: {e}")
             return None
 
-    async def flush(self, session_id: str, audio_cursor_ms: int) -> Optional[TranscriptionResult]:
+    async def flush(
+        self,
+        session_id: str,
+        audio_cursor_ms: int,
+        task: str = "transcribe",
+        beam_size: int = 5,
+    ) -> Optional[TranscriptionResult]:
         """Transcribe any remaining audio and mark all tokens final."""
         state = self._get_session(session_id)
         if len(state["pcm_f32"]) < SAMPLE_RATE * 0.5:
@@ -281,7 +293,7 @@ class WhisperProvider:
 
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, self._run_whisper, state["pcm_f32"].copy(), state, audio_cursor_ms
+            None, self._run_whisper, state["pcm_f32"].copy(), state, audio_cursor_ms, task, beam_size
         )
         if result:
             for t in result.tokens:
@@ -300,16 +312,15 @@ class Session:
     websocket:        WebSocket
     audio_cursor_ms:  int   = 0
     chunk_duration_ms: int  = 60
-    translate:        bool  = False
     created_at:       float = field(default_factory=time.time)
 
 class SessionManager:
     def __init__(self):
         self._sessions: dict[str, Session] = {}
 
-    def create(self, ws: WebSocket, translate: bool = False) -> Session:
+    def create(self, ws: WebSocket) -> Session:
         sid     = str(uuid.uuid4())
-        session = Session(session_id=sid, websocket=ws, translate=translate)
+        session = Session(session_id=sid, websocket=ws)
         self._sessions[sid] = session
         return session
 
@@ -329,7 +340,7 @@ session_manager = SessionManager()
 provider        = WhisperProvider()
 
 BASE_DIR = pathlib.Path(__file__).parent
-with open(BASE_DIR / "index.html") as f:
+with open(BASE_DIR / "index.html", "r", encoding="utf-8") as f:
     HTML_CONTENT = f.read()
 
 
@@ -352,16 +363,21 @@ async def load_model(model_name: str):
 
 
 @app.websocket("/ws/transcribe")
-async def transcribe_ws(websocket: WebSocket, translate: str = "false"):
+async def transcribe_ws(
+    websocket: WebSocket,
+    translate: bool = False,
+    beam_size: int = 5
+):
     await websocket.accept()
-    is_translate = translate.lower() == "true"
-    session = session_manager.create(websocket, translate=is_translate)
+    session = session_manager.create(websocket)
     sid     = session.session_id
 
     await websocket.send_text(json.dumps({
         "type":       "session_init",
         "session_id": sid,
     }))
+
+    task = "translate" if translate else "transcribe"
 
     try:
         while True:
@@ -372,13 +388,14 @@ async def transcribe_ws(websocket: WebSocket, translate: str = "false"):
                 pcm_int16        = data,
                 session_id       = sid,
                 audio_cursor_ms  = session.audio_cursor_ms,
-                translate        = session.translate,
+                task             = task,
+                beam_size        = beam_size,
             )
             if result:
                 await websocket.send_text(result.to_json())
 
     except WebSocketDisconnect:
-        flush = await provider.flush(sid, session.audio_cursor_ms)
+        flush = await provider.flush(sid, session.audio_cursor_ms, task=task, beam_size=beam_size)
         if flush:
             try:
                 await websocket.send_text(flush.to_json())

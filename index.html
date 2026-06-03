@@ -359,10 +359,18 @@ footer {
   <div class="section">
     <div class="section-label">Recording</div>
     <div class="controls">
-      <label style="font-size: 10px; color: var(--text-dim); display: flex; align-items: center; gap: 8px; margin-bottom: 2px; cursor: pointer; text-transform: uppercase; font-weight: 600; letter-spacing: 0.1em;">
+      <label style="font-size: 10px; color: var(--text-dim); display: flex; align-items: center; gap: 8px; margin-bottom: 6px; cursor: pointer; text-transform: uppercase; font-weight: 600; letter-spacing: 0.1em;">
         <input type="checkbox" id="chk-translate" />
         Translate to English
       </label>
+      <div style="margin-bottom: 10px;">
+        <label for="sel-beam-size" style="font-size: 8.5px; color: var(--text-dim); display: block; margin-bottom: 4px; text-transform: uppercase; font-weight: 600; letter-spacing: 0.1em;">Decoding Speed</label>
+        <select id="sel-beam-size" style="width: 100%; background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 6px; font-family: var(--mono); font-size: 10px; border-radius: 3px;">
+          <option value="1" selected>Greedy (Ultra Fast / Beam 1)</option>
+          <option value="3">Balanced (Fast / Beam 3)</option>
+          <option value="5">Accurate (Standard / Beam 5)</option>
+        </select>
+      </div>
       <button class="btn btn-start" id="btn-start" disabled>▶ START TRANSCRIBING</button>
       <button class="btn btn-stop"  id="btn-stop"  disabled>■ STOP</button>
     </div>
@@ -564,7 +572,8 @@ function connectWS(onReady) {
   setConn('connecting');
   log('Connecting…', 'info');
   const doTranslate = $('chk-translate')?.checked ? 'true' : 'false';
-  const url = `ws://${location.host}/ws/transcribe?translate=${doTranslate}`;
+  const beamSize = $('sel-beam-size')?.value || '1';
+  const url = `ws://${location.host}/ws/transcribe?translate=${doTranslate}&beam_size=${beamSize}`;
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
 

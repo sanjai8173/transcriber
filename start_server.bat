@@ -16,9 +16,8 @@ if not exist ".venv\" (
 echo  [INFO] Activating virtual environment...
 call .venv\Scripts\activate.bat
 
-:: Install dependencies if uvicorn is missing
-where uvicorn >nul 2>&1
-if errorlevel 1 (
+:: Install dependencies if uvicorn is missing in local venv
+if not exist ".venv\Scripts\uvicorn.exe" (
     echo  [INFO] Installing dependencies...
     pip install -r requirements.txt
 )
