@@ -4,7 +4,10 @@ Real-Time Speech Transcription Server — Whisper Edition
 FastAPI WebSocket backend with:
   - Local Whisper model support (tiny / base / small / medium / large-v2 / large-v3)
   - Hot-swappable model via REST API (no server restart needed)
-  - Per-session 3-second rolling audio buffer for real streaming feel
+  - Per-session rolling audio buffer for real streaming feel
+  - Voice Activity Detection (client-side RMS + server-side Silero VAD)
+  - Word consensus finalization for improved accuracy
+  - Prompt conditioning for context-aware transcription
   - Token aggregation with interim → final lifecycle
   - Exact response schema compliance
 """
@@ -19,6 +22,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 from collections import deque
 import pathlib
+import re
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -67,10 +71,294 @@ class TranscriptionResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VOICE ACTIVITY DETECTION (Silero VAD)
+# Server-side VAD as a secondary filter. The client already does RMS-based
+# silence gating, but this catches subtler cases and prevents Whisper from
+# hallucinating on near-silence audio.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SileroVAD:
+    """Lightweight wrapper around Silero VAD model for speech detection."""
+
+    def __init__(self):
+        self._model = None
+        self._utils = None
+        self._available = False
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            import torch
+            model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                onnx=False,
+                trust_repo=True,
+            )
+            self._model = model
+            self._utils = utils
+            self._available = True
+            print("[VAD] Silero VAD loaded successfully")
+        except Exception as e:
+            print(f"[VAD] Silero VAD not available ({e}), using energy-based fallback")
+            self._available = False
+
+    def contains_speech(self, audio: np.ndarray, sample_rate: int = 16000,
+                        threshold: float = 0.35) -> bool:
+        """
+        Returns True if the audio chunk contains speech.
+        Uses Silero VAD if available, otherwise falls back to energy-based detection.
+        """
+        if len(audio) < 512:
+            return False
+
+        # Energy-based pre-filter: skip obviously silent audio
+        rms = np.sqrt(np.mean(audio ** 2))
+        if rms < 0.005:
+            return False
+
+        if self._available:
+            try:
+                import torch
+                with self._lock:
+                    # Silero VAD expects 16kHz, mono, float32
+                    tensor = torch.from_numpy(audio).float()
+                    # Process in 512-sample windows (Silero's native chunk size)
+                    window_size = 512
+                    max_prob = 0.0
+                    for i in range(0, len(tensor) - window_size + 1, window_size):
+                        chunk = tensor[i:i + window_size]
+                        prob = self._model(chunk, sample_rate).item()
+                        max_prob = max(max_prob, prob)
+                        if max_prob >= threshold:
+                            return True
+                    return max_prob >= threshold
+            except Exception:
+                pass
+
+        # Fallback: energy-based detection
+        return rms > 0.01
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORD CONSENSUS TRACKER
+# Tracks words across multiple transcription passes. A word becomes "final"
+# only after it appears consistently (same text at approximately the same
+# timestamp) across CONSENSUS_COUNT consecutive passes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONSENSUS_COUNT = 2       # Number of passes a word must survive to be finalized
+TIME_TOLERANCE_MS = 500   # Max timestamp drift to consider words as "the same"
+MIN_CONFIDENCE = 0.25     # Words below this confidence are dropped entirely
+
+class WordConsensusTracker:
+    """
+    Stabilizes transcription output by requiring words to appear consistently
+    across multiple Whisper passes before being marked as final.
+    """
+
+    def __init__(self):
+        # Each entry: {normalized_key: {"text": str, "start_ms": int, "end_ms": int,
+        #              "confidence": float, "count": int, "language": str}}
+        self._candidates: dict[str, dict] = {}
+        self._finalized: list[dict] = []  # Chronologically ordered final words
+        self._finalized_end_ms: int = 0   # End time of last finalized word
+
+    def _normalize_key(self, text: str, start_ms: int) -> str:
+        """Create a fuzzy key for matching words across passes."""
+        clean = text.strip().lower()
+        # Bucket timestamps into TIME_TOLERANCE_MS windows
+        bucket = start_ms // TIME_TOLERANCE_MS
+        return f"{clean}@{bucket}"
+
+    def _alt_keys(self, text: str, start_ms: int) -> list[str]:
+        """Generate alternative keys to handle timestamp jitter."""
+        clean = text.strip().lower()
+        bucket = start_ms // TIME_TOLERANCE_MS
+        return [
+            f"{clean}@{bucket - 1}",
+            f"{clean}@{bucket}",
+            f"{clean}@{bucket + 1}",
+        ]
+
+    def update(self, words: list[dict]) -> list[dict]:
+        """
+        Process a new batch of words from Whisper. Returns the stabilized word
+        list with accurate is_final flags.
+        """
+        new_candidates = {}
+
+        for w in words:
+            text = w["text"]
+            start_ms = w["start_ms"]
+            end_ms = w["end_ms"]
+            confidence = w["confidence"]
+            language = w.get("language", "en")
+
+            # Skip low-confidence noise
+            if confidence < MIN_CONFIDENCE:
+                continue
+
+            # Skip words that are already in finalized region
+            if end_ms <= self._finalized_end_ms:
+                continue
+
+            primary_key = self._normalize_key(text, start_ms)
+
+            # Check if this word existed in previous candidates
+            prev_count = 0
+            matched_key = None
+            for alt_key in self._alt_keys(text, start_ms):
+                if alt_key in self._candidates:
+                    prev = self._candidates[alt_key]
+                    prev_count = max(prev_count, prev["count"])
+                    matched_key = alt_key
+
+            new_count = prev_count + 1
+
+            new_candidates[primary_key] = {
+                "text": text,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "confidence": confidence,
+                "count": new_count,
+                "language": language,
+            }
+
+        self._candidates = new_candidates
+
+        # Build output: finalized words + current candidates
+        result = []
+
+        # Add previously finalized words
+        for fw in self._finalized:
+            result.append({
+                "text": fw["text"],
+                "start_ms": fw["start_ms"],
+                "end_ms": fw["end_ms"],
+                "confidence": fw["confidence"],
+                "is_final": True,
+                "language": fw["language"],
+            })
+
+        # Process current candidates
+        newly_finalized = []
+        interim_words = []
+
+        for key, cand in sorted(self._candidates.items(), key=lambda x: x[1]["start_ms"]):
+            if cand["count"] >= CONSENSUS_COUNT:
+                newly_finalized.append(cand)
+            else:
+                interim_words.append(cand)
+
+        # Finalize words that have reached consensus
+        for nf in newly_finalized:
+            if nf["end_ms"] > self._finalized_end_ms:
+                self._finalized.append(nf)
+                self._finalized_end_ms = nf["end_ms"]
+                result.append({
+                    "text": nf["text"],
+                    "start_ms": nf["start_ms"],
+                    "end_ms": nf["end_ms"],
+                    "confidence": nf["confidence"],
+                    "is_final": True,
+                    "language": nf["language"],
+                })
+
+        # Add interim (not yet confirmed) words
+        for iw in interim_words:
+            result.append({
+                "text": iw["text"],
+                "start_ms": iw["start_ms"],
+                "end_ms": iw["end_ms"],
+                "confidence": iw["confidence"],
+                "is_final": False,
+                "language": iw["language"],
+            })
+
+        return result
+
+    def get_prompt_context(self, max_words: int = 20) -> str:
+        """
+        Returns the last N finalized words as a prompt string.
+        Used to condition Whisper for better continuity.
+        """
+        if not self._finalized:
+            return ""
+        recent = self._finalized[-max_words:]
+        return "".join(w["text"] for w in recent).strip()
+
+    def force_finalize_all(self) -> list[dict]:
+        """Mark all remaining candidates as final (used on flush)."""
+        result = []
+        for fw in self._finalized:
+            result.append({
+                "text": fw["text"],
+                "start_ms": fw["start_ms"],
+                "end_ms": fw["end_ms"],
+                "confidence": fw["confidence"],
+                "is_final": True,
+                "language": fw["language"],
+            })
+
+        for key, cand in sorted(self._candidates.items(), key=lambda x: x[1]["start_ms"]):
+            if cand["confidence"] >= MIN_CONFIDENCE and cand["end_ms"] > self._finalized_end_ms:
+                result.append({
+                    "text": cand["text"],
+                    "start_ms": cand["start_ms"],
+                    "end_ms": cand["end_ms"],
+                    "confidence": cand["confidence"],
+                    "is_final": True,
+                    "language": cand["language"],
+                })
+
+        self._candidates.clear()
+        return result
+
+    def reset(self):
+        self._candidates.clear()
+        self._finalized.clear()
+        self._finalized_end_ms = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPETITION DETECTOR
+# Whisper sometimes hallucinates repeating phrases. This catches and removes
+# obvious repetition patterns.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_repetition(words: list[dict], max_ngram: int = 5) -> list[dict]:
+    """Remove repeated n-gram sequences from word list."""
+    if len(words) < 4:
+        return words
+
+    texts = [w["text"].strip().lower() for w in words]
+    keep = [True] * len(words)
+
+    for n in range(2, min(max_ngram + 1, len(texts) // 2 + 1)):
+        for i in range(len(texts) - 2 * n + 1):
+            ngram1 = tuple(texts[i:i + n])
+            ngram2 = tuple(texts[i + n:i + 2 * n])
+            if ngram1 == ngram2:
+                # Mark the repeated copy for removal
+                for j in range(i + n, i + 2 * n):
+                    keep[j] = False
+
+    return [w for w, k in zip(words, keep) if k]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # WHISPER PROVIDER
 # Uses faster-whisper for low-latency streaming transcription.
 # Audio is accumulated in a rolling buffer; transcription runs every
 # CHUNK_TRIGGER_MS of new audio, returning tokens with timestamps.
+# Now with:
+#   - Silero VAD for server-side silence detection
+#   - Word consensus for finalization accuracy
+#   - Prompt conditioning for contextual continuity
+#   - Repetition detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE        = 16000
@@ -85,6 +373,7 @@ class WhisperProvider:
         self._lock       = threading.Lock()
         self._loading    = False
         self._load_error = None
+        self._vad        = SileroVAD()
 
         # Per-session state
         self._sessions: dict[str, dict] = {}
@@ -141,16 +430,21 @@ class WhisperProvider:
     def _get_session(self, session_id: str) -> dict:
         if session_id not in self._sessions:
             self._sessions[session_id] = {
-                "pcm_f32":       np.array([], dtype=np.float32),
-                "audio_offset":  0,       # ms offset of buffer[0] in the stream
-                "last_run_ms":   0,       # audio_cursor_ms when last transcription ran
+                "pcm_f32":        np.array([], dtype=np.float32),
+                "audio_offset":   0,       # ms offset of buffer[0] in the stream
+                "last_run_ms":    0,       # audio_cursor_ms when last transcription ran
                 "pending_tokens": deque(),
-                "final_cursor":  0,
-                "token_seq":     0,
+                "final_cursor":   0,
+                "token_seq":      0,
+                "consensus":      WordConsensusTracker(),
+                "silence_frames": 0,       # Consecutive silent frames counter
+                "speech_active":  False,    # Whether speech is currently detected
             }
         return self._sessions[session_id]
 
     def reset(self, session_id: str) -> None:
+        if session_id in self._sessions:
+            self._sessions[session_id]["consensus"].reset()
         self._sessions.pop(session_id, None)
 
     # ── Core processing ──────────────────────────────────────────────────
@@ -167,6 +461,21 @@ class WhisperProvider:
 
         # Convert Int16 → Float32 normalized [-1, 1]
         samples = np.frombuffer(pcm_int16, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # ── Server-side VAD: check if chunk contains speech ──────────
+        has_speech = self._vad.contains_speech(samples)
+
+        if has_speech:
+            state["silence_frames"] = 0
+            state["speech_active"] = True
+        else:
+            state["silence_frames"] += 1
+            # After 15 consecutive silent frames (~900ms), stop treating as speech
+            if state["silence_frames"] > 15:
+                state["speech_active"] = False
+
+        # Always accumulate audio (needed for context), but skip transcription
+        # if we're in a prolonged silence
         state["pcm_f32"] = np.concatenate([state["pcm_f32"], samples])
 
         # Cap rolling buffer to MAX_BUFFER_MS
@@ -181,6 +490,11 @@ class WhisperProvider:
         if since_last < CHUNK_TRIGGER_MS:
             return None
 
+        # Skip Whisper if we haven't detected speech recently
+        if not state["speech_active"]:
+            state["last_run_ms"] = audio_cursor_ms
+            return None
+
         with self._lock:
             model = self._model
 
@@ -189,10 +503,14 @@ class WhisperProvider:
 
         state["last_run_ms"] = audio_cursor_ms
 
+        # Get prompt context from consensus tracker for better accuracy
+        prompt_context = state["consensus"].get_prompt_context()
+
         # Run Whisper in a thread pool (CPU-bound)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, self._run_whisper, state["pcm_f32"].copy(), state, audio_cursor_ms, task, beam_size
+            None, self._run_whisper, state["pcm_f32"].copy(), state,
+            audio_cursor_ms, task, beam_size, prompt_context
         )
         return result
 
@@ -203,6 +521,7 @@ class WhisperProvider:
         audio_cursor_ms: int,
         task: str = "transcribe",
         beam_size: int = 5,
+        prompt_context: str = "",
     ) -> Optional[TranscriptionResult]:
         try:
             with self._lock:
@@ -210,52 +529,101 @@ class WhisperProvider:
             if model is None:
                 return None
 
-            segments, info = model.transcribe(
-                audio,
+            # ── Server-side VAD on the full buffer before transcribing ──
+            # Check if the audio buffer has meaningful speech content
+            if not self._vad.contains_speech(audio):
+                return None
+
+            # Build transcription kwargs
+            transcribe_kwargs = dict(
                 language=None,               # auto-detect
                 task=task,
                 word_timestamps=True,        # essential for token-level output
-                vad_filter=True,             # skip silence
-                vad_parameters={"min_silence_duration_ms": 300},
+                vad_filter=True,             # faster-whisper's built-in VAD
+                vad_parameters={
+                    "min_silence_duration_ms": 300,
+                    "speech_pad_ms": 200,
+                    "threshold": 0.35,
+                },
                 beam_size=beam_size,
                 without_timestamps=False,
+                no_speech_threshold=0.5,     # Higher threshold = stricter silence filtering
+                log_prob_threshold=-0.8,     # Filter very low probability segments
+                condition_on_previous_text=True,
+                compression_ratio_threshold=2.2,  # Catch repetitive/hallucinated output
             )
 
+            # Use prompt conditioning if we have finalized context
+            if prompt_context:
+                transcribe_kwargs["initial_prompt"] = prompt_context
+
+            segments, info = model.transcribe(audio, **transcribe_kwargs)
+
             offset_ms = state["audio_offset"]
-            tokens    = []
+            raw_words = []
 
             for seg in segments:
                 lang = info.language if info else "en"
+
+                # Skip segments with very low average log probability
+                if hasattr(seg, 'avg_logprob') and seg.avg_logprob < -1.0:
+                    continue
+
+                # Skip segments with very high no-speech probability
+                if hasattr(seg, 'no_speech_prob') and seg.no_speech_prob > 0.6:
+                    continue
+
                 if seg.words:
                     for word in seg.words:
-                        # Mark as final if the word is >1 s before current cursor
+                        word_start_ms = int(word.start * 1000) + offset_ms
                         word_end_ms = int(word.end * 1000) + offset_ms
-                        is_final    = (audio_cursor_ms - word_end_ms) > 1000
-                        tok = Token(
-                            text        = word.word,  # faster-whisper preserves leading spaces
-                            start_ms    = int(word.start * 1000) + offset_ms,
-                            end_ms      = word_end_ms,
-                            confidence  = round(float(word.probability), 3),
-                            is_final    = is_final,
-                            speaker     = "1",
-                            language    = lang,
-                        )
-                        tokens.append(tok)
+                        raw_words.append({
+                            "text": word.word,
+                            "start_ms": word_start_ms,
+                            "end_ms": word_end_ms,
+                            "confidence": round(float(word.probability), 3),
+                            "language": lang,
+                        })
                 else:
                     # No word timestamps — emit segment as single token
-                    tok = Token(
-                        text        = seg.text,
-                        start_ms    = int(seg.start * 1000) + offset_ms,
-                        end_ms      = int(seg.end   * 1000) + offset_ms,
-                        confidence  = round(float(getattr(seg, "avg_logprob", -0.3) + 1), 3),
-                        is_final    = True,
-                        speaker     = "1",
-                        language    = lang,
-                    )
-                    tokens.append(tok)
+                    seg_start_ms = int(seg.start * 1000) + offset_ms
+                    seg_end_ms = int(seg.end * 1000) + offset_ms
+                    conf = round(float(getattr(seg, "avg_logprob", -0.3) + 1), 3)
+                    if conf > MIN_CONFIDENCE:
+                        raw_words.append({
+                            "text": seg.text,
+                            "start_ms": seg_start_ms,
+                            "end_ms": seg_end_ms,
+                            "confidence": conf,
+                            "language": lang,
+                        })
 
-            if not tokens:
+            if not raw_words:
                 return None
+
+            # ── Repetition detection ──
+            raw_words = detect_repetition(raw_words)
+
+            # ── Word consensus finalization ──
+            consensus = state["consensus"]
+            stabilized_words = consensus.update(raw_words)
+
+            if not stabilized_words:
+                return None
+
+            # Convert to Token objects
+            tokens = []
+            for w in stabilized_words:
+                tok = Token(
+                    text       = w["text"],
+                    start_ms   = w["start_ms"],
+                    end_ms     = w["end_ms"],
+                    confidence = w["confidence"],
+                    is_final   = w["is_final"],
+                    speaker    = "1",
+                    language   = w["language"],
+                )
+                tokens.append(tok)
 
             final_cursor = max(
                 (t.end_ms for t in tokens if t.is_final),
@@ -272,6 +640,8 @@ class WhisperProvider:
 
         except Exception as e:
             print(f"[Whisper] Transcription error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     async def flush(
@@ -284,6 +654,24 @@ class WhisperProvider:
         """Transcribe any remaining audio and mark all tokens final."""
         state = self._get_session(session_id)
         if len(state["pcm_f32"]) < SAMPLE_RATE * 0.5:
+            # Even if buffer is small, flush any remaining consensus candidates
+            consensus = state["consensus"]
+            final_words = consensus.force_finalize_all()
+            if final_words:
+                tokens = [
+                    Token(
+                        text=w["text"], start_ms=w["start_ms"], end_ms=w["end_ms"],
+                        confidence=w["confidence"], is_final=True, speaker="1",
+                        language=w["language"],
+                    )
+                    for w in final_words
+                ]
+                return TranscriptionResult(
+                    tokens=tokens,
+                    audio_offset_ms=state["audio_offset"],
+                    final_audio_proc_ms=audio_cursor_ms,
+                    total_audio_proc_ms=audio_cursor_ms,
+                )
             return None
 
         with self._lock:
@@ -291,14 +679,39 @@ class WhisperProvider:
         if model is None:
             return None
 
+        prompt_context = state["consensus"].get_prompt_context()
+
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None, self._run_whisper, state["pcm_f32"].copy(), state, audio_cursor_ms, task, beam_size
+            None, self._run_whisper, state["pcm_f32"].copy(), state,
+            audio_cursor_ms, task, beam_size, prompt_context
         )
+
+        # Force-finalize everything on flush
+        consensus = state["consensus"]
+        final_words = consensus.force_finalize_all()
+
+        if final_words:
+            tokens = [
+                Token(
+                    text=w["text"], start_ms=w["start_ms"], end_ms=w["end_ms"],
+                    confidence=w["confidence"], is_final=True, speaker="1",
+                    language=w["language"],
+                )
+                for w in final_words
+            ]
+            return TranscriptionResult(
+                tokens=tokens,
+                audio_offset_ms=state["audio_offset"],
+                final_audio_proc_ms=audio_cursor_ms,
+                total_audio_proc_ms=audio_cursor_ms,
+            )
+
         if result:
             for t in result.tokens:
                 t.is_final = True
             result.final_audio_proc_ms = audio_cursor_ms
+
         return result
 
 

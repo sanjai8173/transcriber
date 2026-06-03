@@ -99,6 +99,33 @@ header::after {
 .conn-pill.connected  .dot { background: var(--green); box-shadow: 0 0 6px var(--green-dim); }
 .conn-pill.recording  .dot { background: var(--red); box-shadow: 0 0 6px var(--red); animation: blink 0.9s infinite; }
 .conn-pill.connecting .dot { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+
+/* ── VAD indicator ───────────────────────────────────────────────── */
+.vad-pill {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 20px;
+  border: 1px solid var(--border); background: var(--surface2);
+  font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase;
+  transition: all 0.2s;
+}
+.vad-pill.speech {
+  border-color: rgba(0,245,160,0.4);
+  background: rgba(0,245,160,0.06);
+}
+.vad-pill.silence {
+  border-color: var(--border);
+  opacity: 0.5;
+}
+.vad-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-muted); transition: all 0.15s;
+}
+.vad-pill.speech .vad-dot {
+  background: var(--green); box-shadow: 0 0 8px var(--green);
+}
+.vad-pill.silence .vad-dot {
+  background: var(--text-muted);
+}
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
 /* ── Sidebar ─────────────────────────────────────────────────────── */
@@ -258,9 +285,15 @@ main {
 }
 
 /* Tokens */
-.tok { display: inline; transition: color 0.25s, opacity 0.25s; }
-.tok.interim { color: var(--interim); opacity: 0.72; border-bottom: 1px dotted rgba(96,216,248,0.3); }
-.tok.final   { color: var(--final); opacity: 1; border-bottom: none; }
+.tok { display: inline; transition: color 0.35s, opacity 0.35s; }
+.tok.interim { color: var(--interim); opacity: 0.65; border-bottom: 1px dotted rgba(96,216,248,0.3); font-style: italic; }
+.tok.final   { color: var(--final); opacity: 1; border-bottom: none; font-style: normal; }
+.tok.final.just-finalized { animation: finalize-glow 0.6s ease-out; }
+@keyframes finalize-glow {
+  0%   { color: var(--green); text-shadow: 0 0 8px rgba(0,245,160,0.4); }
+  100% { color: var(--final); text-shadow: none; }
+}
+.tok.low-conf { opacity: 0.45; text-decoration: underline wavy rgba(255,170,48,0.3); }
 .tok[data-tip] { cursor: default; position: relative; }
 .tok[data-tip]:hover::after {
   content: attr(data-tip);
@@ -325,11 +358,15 @@ footer {
   <div class="header-sep"></div>
   <div class="header-tag">Local Whisper Engine</div>
   <div class="header-right">
+    <div class="vad-pill silence" id="vad-pill">
+      <span class="vad-dot" id="vad-dot"></span>
+      <span id="vad-text">VAD</span>
+    </div>
     <div class="conn-pill" id="conn-pill">
       <span class="dot" id="conn-dot"></span>
       <span id="conn-text">DISCONNECTED</span>
     </div>
-    <div style="font-size:8.5px;color:var(--text-muted);letter-spacing:0.08em;">PCM·INT16·16kHz·60ms</div>
+    <div style="font-size:8.5px;color:var(--text-muted);letter-spacing:0.08em;">PCM·INT16·16kHz·VAD</div>
   </div>
 </header>
 
@@ -381,9 +418,11 @@ footer {
     <div class="section-label">Live Stats</div>
     <div class="stats-grid">
       <div class="stat"><div class="stat-val" id="stat-tok">0</div><div class="stat-lbl">Tokens</div></div>
-      <div class="stat"><div class="stat-val" id="stat-wrd">0</div><div class="stat-lbl">Words</div></div>
+      <div class="stat"><div class="stat-val" id="stat-wrd">0</div><div class="stat-lbl">Words (Final)</div></div>
       <div class="stat"><div class="stat-val" id="stat-conf">—</div><div class="stat-lbl">Avg Conf</div></div>
       <div class="stat"><div class="stat-val" id="stat-lang">—</div><div class="stat-lbl">Language</div></div>
+      <div class="stat"><div class="stat-val" id="stat-skip">0</div><div class="stat-lbl">Silent Skips</div></div>
+      <div class="stat"><div class="stat-val" id="stat-vad">—</div><div class="stat-lbl">VAD State</div></div>
     </div>
   </div>
 
@@ -437,11 +476,16 @@ footer {
 
 <script>
 /* ═══════════════════════════════════════════════════════════════════
-   VOXSTREAM FRONTEND — Whisper Edition
+   VOXSTREAM FRONTEND — Whisper Edition + VAD + Word Finalization
    ═══════════════════════════════════════════════════════════════════ */
 
 const SAMPLE_RATE    = 16000;
 const CHUNK_SAMPLES  = 1024; // 60 ms
+
+// ── VAD Configuration ─────────────────────────────────────────────
+const VAD_RMS_THRESHOLD  = 0.008;   // RMS energy threshold for speech
+const VAD_SILENCE_FRAMES = 12;      // Consecutive silent frames before VAD=off (~720ms)
+const VAD_HOLDOVER_MS    = 500;     // Keep sending this long after speech stops
 
 // ── State ─────────────────────────────────────────────────────────
 let ws = null, audioCtx = null, mediaStream = null, processor = null, analyser = null;
@@ -450,6 +494,17 @@ let sessionId = null, totalChunks = 0, totalAudioMs = 0, maxAudioMs = 1;
 let selectedModel = null, loadedModel = null;
 let _lastHash = '';
 let _pollTimer = null; // model-load poll
+
+// ── VAD State ─────────────────────────────────────────────────────
+let vadSpeechActive = false;
+let vadSilenceCount = 0;
+let vadSkippedChunks = 0;
+let vadLastSpeechTime = 0;
+
+// ── Finalized Word Tracking ───────────────────────────────────────
+// The server now handles consensus-based finalization, but we track
+// finalized words on the client to avoid replacing them with interim.
+const finalizedWords = new Map();  // start_ms -> token data
 
 // ── DOM ────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -465,6 +520,8 @@ const txBody      = $('tx-body');
 const modelGrid   = $('model-grid');
 const modelBar    = $('model-status-bar');
 const procBadge   = $('processing-badge');
+const vadPill     = $('vad-pill');
+const vadText     = $('vad-text');
 
 // ── Model data (mirrors server WHISPER_MODELS) ─────────────────────
 const MODELS = {
@@ -475,6 +532,46 @@ const MODELS = {
   "large-v2": { size: "~3.1 GB", speed: "~1x real-time",  stars: 5 },
   "large-v3": { size: "~3.1 GB", speed: "~1x real-time",  stars: 5 },
 };
+
+// ── Client-side Voice Activity Detection ──────────────────────────
+function computeRMS(float32Array) {
+  let sum = 0;
+  for (let i = 0; i < float32Array.length; i++) {
+    sum += float32Array[i] * float32Array[i];
+  }
+  return Math.sqrt(sum / float32Array.length);
+}
+
+function updateVAD(rms) {
+  const now = performance.now();
+
+  if (rms >= VAD_RMS_THRESHOLD) {
+    vadSpeechActive = true;
+    vadSilenceCount = 0;
+    vadLastSpeechTime = now;
+    vadPill.className = 'vad-pill speech';
+    vadText.textContent = 'SPEECH';
+    $('stat-vad').textContent = '🗣️';
+    return true; // speech detected → send chunk
+  }
+
+  vadSilenceCount++;
+
+  // Holdover: keep sending for a short time after speech stops
+  // to capture trailing consonants and natural word endings
+  if (vadSpeechActive && (now - vadLastSpeechTime) < VAD_HOLDOVER_MS) {
+    return true; // still in holdover → send chunk
+  }
+
+  if (vadSilenceCount >= VAD_SILENCE_FRAMES) {
+    vadSpeechActive = false;
+    vadPill.className = 'vad-pill silence';
+    vadText.textContent = 'SILENT';
+    $('stat-vad').textContent = '🔇';
+  }
+
+  return false; // silence → skip chunk
+}
 
 // ── Build model cards ─────────────────────────────────────────────
 function renderModelCards(activeModel) {
@@ -596,7 +693,7 @@ function connectWS(onReady) {
   ws.onclose = () => { setConn('disconnected'); log('Disconnected', 'warn'); };
 }
 
-// ── Audio capture ─────────────────────────────────────────────────
+// ── Audio capture (with client-side VAD) ──────────────────────────
 const NUM_BARS = 22;
 const vuMeter  = $('vu-meter');
 const canvas   = $('waveform');
@@ -626,7 +723,8 @@ function drawAudio() {
   const H = canvas.height = canvas.offsetHeight * devicePixelRatio;
   ctx2d.clearRect(0,0,W,H);
   ctx2d.beginPath();
-  ctx2d.strokeStyle = 'rgba(0,200,240,0.5)';
+  // Color waveform based on VAD state
+  ctx2d.strokeStyle = vadSpeechActive ? 'rgba(0,245,160,0.6)' : 'rgba(0,200,240,0.3)';
   ctx2d.lineWidth = devicePixelRatio;
   const sw = W / waveData.length;
   let x = 0;
@@ -638,6 +736,13 @@ function drawAudio() {
 }
 
 async function startCapture() {
+  // Reset VAD state
+  vadSpeechActive = false;
+  vadSilenceCount = 0;
+  vadSkippedChunks = 0;
+  vadLastSpeechTime = 0;
+  finalizedWords.clear();
+
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true }
   });
@@ -660,6 +765,19 @@ async function startCapture() {
     tmp.set(buf); tmp.set(f32, buf.length); buf = tmp;
     while (buf.length >= CHUNK_SAMPLES) {
       const chunk = buf.slice(0, CHUNK_SAMPLES); buf = buf.slice(CHUNK_SAMPLES);
+
+      // ── Client-side VAD: compute RMS energy ──
+      const rms = computeRMS(chunk);
+      const shouldSend = updateVAD(rms);
+
+      if (!shouldSend) {
+        // Silent chunk — skip sending to server
+        vadSkippedChunks++;
+        totalAudioMs += 60;  // Still count time for cursor accuracy
+        $('stat-skip').textContent = vadSkippedChunks;
+        continue;
+      }
+
       const i16 = new Int16Array(chunk.length);
       for (let i = 0; i < chunk.length; i++) {
         const c = Math.max(-1, Math.min(1, chunk[i]));
@@ -677,6 +795,7 @@ async function startCapture() {
     }
   };
   rafId = requestAnimationFrame(drawAudio);
+  log('VAD enabled', 'success');
 }
 
 function stopCapture() {
@@ -686,11 +805,12 @@ function stopCapture() {
   processor = mediaStream = analyser = null;
   vuBars.forEach(b => { b.style.height = '2px'; b.style.background = 'var(--border)'; });
   ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  vadPill.className = 'vad-pill silence';
+  vadText.textContent = 'VAD';
+  $('stat-vad').textContent = '—';
 }
 
-// ── Token ingestion ───────────────────────────────────────────────
-function makeId(tok) { return `${tok.start_ms}__${tok.text.trim().slice(0,14)}`; }
-
+// ── Token ingestion (with finalization tracking) ──────────────────
 function ingestResult(result) {
   const { tokens, audio_offset_ms, final_audio_proc_ms, total_audio_proc_ms } = result;
   maxAudioMs = Math.max(maxAudioMs, total_audio_proc_ms, 1);
@@ -699,9 +819,11 @@ function ingestResult(result) {
   $('ms-final').textContent  = final_audio_proc_ms + ' ms';
   $('ms-total').textContent  = total_audio_proc_ms  + ' ms';
 
+  // Clear non-finalized tokens that will be replaced by new results
+  // Keep finalized tokens intact — they've been consensus-confirmed
   const toDelete = [];
   for (const [id, t] of tokenMap) {
-    if (t.start_ms >= (audio_offset_ms || 0)) {
+    if (!t.is_final) {
       toDelete.push(id);
     }
   }
@@ -713,9 +835,29 @@ function ingestResult(result) {
 
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
-    const id = `${tok.start_ms}__${i}__${Math.random().toString(36).slice(2, 7)}`;
-    tokenMap.set(id, {...tok, _id: id});
-    tokenOrder.push(id);
+
+    // Create stable IDs for finalized tokens to prevent flickering
+    let id;
+    if (tok.is_final) {
+      id = `final_${tok.start_ms}_${tok.text.trim().slice(0,20)}`;
+      // Skip if this finalized word is already in the map
+      if (tokenMap.has(id)) continue;
+    } else {
+      id = `interim_${tok.start_ms}_${i}_${Math.random().toString(36).slice(2,7)}`;
+    }
+
+    // Track if a word just became finalized (for animation)
+    const wasPreviouslyInterim = !tok.is_final ? false :
+      !finalizedWords.has(tok.start_ms);
+
+    if (tok.is_final) {
+      finalizedWords.set(tok.start_ms, tok);
+    }
+
+    tokenMap.set(id, {...tok, _id: id, _justFinalized: wasPreviouslyInterim && tok.is_final});
+    if (!tokenOrder.includes(id)) {
+      tokenOrder.push(id);
+    }
   }
 
   tokenOrder.sort((a, b) => (tokenMap.get(a)?.start_ms || 0) - (tokenMap.get(b)?.start_ms || 0));
@@ -723,7 +865,7 @@ function ingestResult(result) {
   renderTranscript(); updateStats();
 }
 
-// ── Renderer ──────────────────────────────────────────────────────
+// ── Renderer (with finalization animations) ───────────────────────
 function renderTranscript() {
   const toks = tokenOrder.map(id => tokenMap.get(id)).filter(Boolean);
   if (!toks.length) return;
@@ -741,11 +883,23 @@ function renderTranscript() {
     seen.add(tok._id);
     let span = exMap.get(tok._id);
     if (!span) { span = document.createElement('span'); span.dataset.id = tok._id; }
-    span.className = `tok ${tok.is_final ? 'final' : 'interim'}`;
+
+    // Build CSS class list
+    let cls = `tok ${tok.is_final ? 'final' : 'interim'}`;
+    if (tok._justFinalized) cls += ' just-finalized';
+    if (tok.confidence < 0.4) cls += ' low-conf';
+    span.className = cls;
+
     span.textContent = tok.text;
     const c = (tok.confidence*100).toFixed(1);
-    span.dataset.tip = `${c}% · ${tok.language} · ${tok.start_ms}→${tok.end_ms}ms`;
+    const status = tok.is_final ? '✓ FINAL' : '… interim';
+    span.dataset.tip = `${c}% · ${status} · ${tok.language} · ${tok.start_ms}→${tok.end_ms}ms`;
     frag.appendChild(span);
+
+    // Clear the just-finalized flag after a short delay
+    if (tok._justFinalized) {
+      setTimeout(() => { tok._justFinalized = false; }, 700);
+    }
   }
   existing.forEach(el => { if (!seen.has(el.dataset.id)) el.remove(); });
   txContent.appendChild(frag);
@@ -754,13 +908,15 @@ function renderTranscript() {
 
 function updateStats() {
   const toks = [...tokenMap.values()];
-  const words = toks.filter(t => t.text.trim()).length;
+  const finalWords = toks.filter(t => t.text.trim() && t.is_final).length;
+  const totalWords = toks.filter(t => t.text.trim()).length;
   const conf  = toks.length ? (toks.reduce((s,t)=>s+t.confidence,0)/toks.length).toFixed(2) : '—';
   const lang  = toks.length ? toks[toks.length-1].language : '—';
   $('stat-tok').textContent  = toks.length;
-  $('stat-wrd').textContent  = words;
+  $('stat-wrd').textContent  = `${finalWords}/${totalWords}`;
   $('stat-conf').textContent = conf;
   $('stat-lang').textContent = lang.toUpperCase();
+  $('stat-skip').textContent = vadSkippedChunks;
 }
 
 // ── Connection status ─────────────────────────────────────────────
@@ -802,12 +958,14 @@ btnStop.addEventListener('click', () => {
   btnStart.disabled = false; btnStop.disabled = true;
   procBadge.classList.remove('visible');
   log('Stopped', 'warn');
-  totalChunks = 0; totalAudioMs = 0;
+  if (vadSkippedChunks > 0) log(`Skipped ${vadSkippedChunks} silent chunks`, 'info');
+  totalChunks = 0; totalAudioMs = 0; vadSkippedChunks = 0;
   $('inf-chunks').textContent = '0'; $('inf-audio').textContent = '0 ms';
 });
 
 btnClear.addEventListener('click', () => {
   tokenMap.clear(); tokenOrder.length = 0;
+  finalizedWords.clear();
   txContent.innerHTML = ''; _lastHash = '';
   emptyState.style.display = '';
   updateStats();
