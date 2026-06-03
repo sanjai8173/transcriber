@@ -6,16 +6,20 @@ echo  ║   VOXSTREAM  —  Starting Server         ║
 echo  ╚══════════════════════════════════════════╝
 echo.
 
-:: Activate venv if it exists
-if exist ".venv\Scripts\activate.bat" (
-    echo  [INFO] Activating virtual environment…
-    call .venv\Scripts\activate.bat
+:: Create venv if it doesn't exist
+if not exist ".venv\" (
+    echo  [INFO] Creating virtual environment...
+    python -m venv .venv
 )
 
-:: Check uvicorn
+:: Activate venv
+echo  [INFO] Activating virtual environment...
+call .venv\Scripts\activate.bat
+
+:: Install dependencies if uvicorn is missing
 where uvicorn >nul 2>&1
 if errorlevel 1 (
-    echo  [INFO] Installing dependencies…
+    echo  [INFO] Installing dependencies...
     pip install -r requirements.txt
 )
 
