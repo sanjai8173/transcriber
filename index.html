@@ -494,6 +494,7 @@ let sessionId = null, totalChunks = 0, totalAudioMs = 0, maxAudioMs = 1;
 let selectedModel = null, loadedModel = null;
 let _lastHash = '';
 let _pollTimer = null; // model-load poll
+let maxFinalAudioProcMs = 0;
 
 // ── VAD State ─────────────────────────────────────────────────────
 let vadSpeechActive = false;
@@ -742,6 +743,7 @@ async function startCapture() {
   vadSkippedChunks = 0;
   vadLastSpeechTime = 0;
   finalizedWords.clear();
+  maxFinalAudioProcMs = 0;
 
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: { sampleRate: SAMPLE_RATE, channelCount: 1, echoCancellation: true, noiseSuppression: true }
@@ -808,6 +810,7 @@ function stopCapture() {
   vadPill.className = 'vad-pill silence';
   vadText.textContent = 'VAD';
   $('stat-vad').textContent = '—';
+  maxFinalAudioProcMs = 0;
 }
 
 // ── Token ingestion (with finalization tracking) ──────────────────
@@ -818,6 +821,10 @@ function ingestResult(result) {
   $('bar-total').style.width = Math.min(100, total_audio_proc_ms/maxAudioMs*100)  + '%';
   $('ms-final').textContent  = final_audio_proc_ms + ' ms';
   $('ms-total').textContent  = total_audio_proc_ms  + ' ms';
+
+  if (final_audio_proc_ms > maxFinalAudioProcMs) {
+    maxFinalAudioProcMs = final_audio_proc_ms;
+  }
 
   // Clear non-finalized tokens that will be replaced by new results
   // Keep finalized tokens intact — they've been consensus-confirmed
@@ -835,6 +842,11 @@ function ingestResult(result) {
 
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
+
+    // Filter out interim tokens that are in the finalized region to prevent duplicate words
+    if (!tok.is_final && tok.end_ms <= maxFinalAudioProcMs) {
+      continue;
+    }
 
     // Create stable IDs for finalized tokens to prevent flickering
     let id;
@@ -966,6 +978,7 @@ btnStop.addEventListener('click', () => {
 btnClear.addEventListener('click', () => {
   tokenMap.clear(); tokenOrder.length = 0;
   finalizedWords.clear();
+  maxFinalAudioProcMs = 0;
   txContent.innerHTML = ''; _lastHash = '';
   emptyState.style.display = '';
   updateStats();

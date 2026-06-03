@@ -317,6 +317,10 @@ class WordConsensusTracker:
         self._candidates.clear()
         return result
 
+    def get_finalized_copy(self) -> list[dict]:
+        """Return a copy of the finalized words list."""
+        return [dict(fw) for fw in self._finalized]
+
     def reset(self):
         self._candidates.clear()
         self._finalized.clear()
@@ -361,10 +365,11 @@ def detect_repetition(words: list[dict], max_ngram: int = 5) -> list[dict]:
 #   - Repetition detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-SAMPLE_RATE        = 16000
-CHUNK_TRIGGER_MS   = 3000   # Run Whisper every 3 s of buffered audio
-MAX_BUFFER_MS      = 30000  # Keep max 30 s of rolling context
-OVERLAP_MS         = 1000   # Overlap between windows to avoid cut-off words
+SAMPLE_RATE         = 16000
+FAST_TRIGGER_MS     = 500    # Run fast Whisper pass every 500ms
+ACCURATE_TRIGGER_MS = 3000   # Run accurate Whisper pass every 3s
+MAX_BUFFER_MS       = 30000  # Keep max 30 s of rolling context
+OVERLAP_MS          = 1000   # Overlap between windows to avoid cut-off words
 
 class WhisperProvider:
     def __init__(self):
@@ -432,7 +437,12 @@ class WhisperProvider:
             self._sessions[session_id] = {
                 "pcm_f32":        np.array([], dtype=np.float32),
                 "audio_offset":   0,       # ms offset of buffer[0] in the stream
-                "last_run_ms":    0,       # audio_cursor_ms when last transcription ran
+                "last_fast_ms":   0,       # audio_cursor_ms when last fast pass ran
+                "last_accurate_ms": 0,     # audio_cursor_ms when last accurate pass ran
+                "fast_in_progress": False,
+                "accurate_in_progress": False,
+                "websocket":      None,
+                "send_lock":      None,
                 "pending_tokens": deque(),
                 "final_cursor":   0,
                 "token_seq":      0,
@@ -456,13 +466,17 @@ class WhisperProvider:
         audio_cursor_ms: int,
         task: str = "transcribe",
         beam_size: int = 5,
-    ) -> Optional[TranscriptionResult]:
+        websocket: WebSocket = None,
+    ) -> None:
         state = self._get_session(session_id)
+        if "websocket" not in state or state["websocket"] is None:
+            state["websocket"] = websocket
+            state["send_lock"] = asyncio.Lock()
 
         # Convert Int16 → Float32 normalized [-1, 1]
         samples = np.frombuffer(pcm_int16, dtype=np.int16).astype(np.float32) / 32768.0
 
-        # ── Server-side VAD: check if chunk contains speech ──────────
+        # Server-side VAD: check if chunk contains speech
         has_speech = self._vad.contains_speech(samples)
 
         if has_speech:
@@ -474,8 +488,7 @@ class WhisperProvider:
             if state["silence_frames"] > 15:
                 state["speech_active"] = False
 
-        # Always accumulate audio (needed for context), but skip transcription
-        # if we're in a prolonged silence
+        # Always accumulate audio (needed for context)
         state["pcm_f32"] = np.concatenate([state["pcm_f32"], samples])
 
         # Cap rolling buffer to MAX_BUFFER_MS
@@ -485,43 +498,79 @@ class WhisperProvider:
             state["pcm_f32"] = state["pcm_f32"][drop:]
             state["audio_offset"] += int(drop / SAMPLE_RATE * 1000)
 
-        # Only run Whisper every CHUNK_TRIGGER_MS of new audio
-        since_last = audio_cursor_ms - state["last_run_ms"]
-        if since_last < CHUNK_TRIGGER_MS:
-            return None
-
         # Skip Whisper if we haven't detected speech recently
         if not state["speech_active"]:
-            state["last_run_ms"] = audio_cursor_ms
-            return None
+            state["last_fast_ms"] = audio_cursor_ms
+            state["last_accurate_ms"] = audio_cursor_ms
+            return
 
-        with self._lock:
-            model = self._model
+        # Check if fast pass should run
+        since_last_fast = audio_cursor_ms - state["last_fast_ms"]
+        if since_last_fast >= FAST_TRIGGER_MS and not state["fast_in_progress"]:
+            state["last_fast_ms"] = audio_cursor_ms
+            state["fast_in_progress"] = True
+            asyncio.create_task(self._run_fast_pass_task(session_id, audio_cursor_ms, task))
 
-        if model is None:
-            return None  # Model not loaded yet
+        # Check if accurate pass should run
+        since_last_accurate = audio_cursor_ms - state["last_accurate_ms"]
+        if since_last_accurate >= ACCURATE_TRIGGER_MS and not state["accurate_in_progress"]:
+            state["last_accurate_ms"] = audio_cursor_ms
+            state["accurate_in_progress"] = True
+            asyncio.create_task(self._run_accurate_pass_task(session_id, audio_cursor_ms, task, beam_size))
 
-        state["last_run_ms"] = audio_cursor_ms
+    async def _run_fast_pass_task(self, session_id: str, audio_cursor_ms: int, task: str):
+        try:
+            state = self._sessions.get(session_id)
+            if not state or not state["speech_active"]:
+                return
 
-        # Get prompt context from consensus tracker for better accuracy
-        prompt_context = state["consensus"].get_prompt_context()
+            offset_ms = state["audio_offset"]
+            final_cursor = state["final_cursor"]
+            
+            # Start from final_cursor - OVERLAP_MS to keep context
+            start_ms = max(offset_ms, final_cursor - OVERLAP_MS)
+            start_sample = int((start_ms - offset_ms) * SAMPLE_RATE / 1000)
+            
+            audio = state["pcm_f32"]
+            if start_sample >= len(audio):
+                return
+                
+            audio_slice = audio[start_sample:].copy()
+            if len(audio_slice) < SAMPLE_RATE * 0.1:  # at least 100ms
+                return
 
-        # Run Whisper in a thread pool (CPU-bound)
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, self._run_whisper, state["pcm_f32"].copy(), state,
-            audio_cursor_ms, task, beam_size, prompt_context
-        )
-        return result
+            with self._lock:
+                model = self._model
+            if model is None:
+                return
 
-    def _run_whisper(
+            prompt_context = state["consensus"].get_prompt_context()
+            finalized_words = state["consensus"].get_finalized_copy()
+
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, self._run_whisper_fast, audio_slice, start_ms, task, prompt_context, finalized_words, final_cursor
+            )
+
+            if result and state["websocket"]:
+                async with state["send_lock"]:
+                    await state["websocket"].send_text(result.to_json())
+                    
+        except Exception as e:
+            print(f"[Whisper] Fast pass error: {e}")
+        finally:
+            state = self._sessions.get(session_id)
+            if state:
+                state["fast_in_progress"] = False
+
+    def _run_whisper_fast(
         self,
         audio: np.ndarray,
-        state: dict,
-        audio_cursor_ms: int,
-        task: str = "transcribe",
-        beam_size: int = 5,
-        prompt_context: str = "",
+        start_ms: int,
+        task: str,
+        prompt_context: str,
+        finalized_words: list[dict],
+        final_cursor: int,
     ) -> Optional[TranscriptionResult]:
         try:
             with self._lock:
@@ -529,54 +578,42 @@ class WhisperProvider:
             if model is None:
                 return None
 
-            # ── Server-side VAD on the full buffer before transcribing ──
-            # Check if the audio buffer has meaningful speech content
-            if not self._vad.contains_speech(audio):
-                return None
-
-            # Build transcription kwargs
             transcribe_kwargs = dict(
-                language=None,               # auto-detect
+                language=None,
                 task=task,
-                word_timestamps=True,        # essential for token-level output
-                vad_filter=True,             # faster-whisper's built-in VAD
+                word_timestamps=True,
+                vad_filter=True,
                 vad_parameters={
                     "min_silence_duration_ms": 300,
                     "speech_pad_ms": 200,
                     "threshold": 0.35,
                 },
-                beam_size=beam_size,
+                beam_size=1,  # Greedy decoding for maximum speed
                 without_timestamps=False,
-                no_speech_threshold=0.5,     # Higher threshold = stricter silence filtering
-                log_prob_threshold=-0.8,     # Filter very low probability segments
+                no_speech_threshold=0.5,
+                log_prob_threshold=-0.8,
                 condition_on_previous_text=True,
-                compression_ratio_threshold=2.2,  # Catch repetitive/hallucinated output
+                compression_ratio_threshold=2.2,
             )
 
-            # Use prompt conditioning if we have finalized context
             if prompt_context:
                 transcribe_kwargs["initial_prompt"] = prompt_context
 
             segments, info = model.transcribe(audio, **transcribe_kwargs)
 
-            offset_ms = state["audio_offset"]
             raw_words = []
-
             for seg in segments:
                 lang = info.language if info else "en"
-
-                # Skip segments with very low average log probability
+                
                 if hasattr(seg, 'avg_logprob') and seg.avg_logprob < -1.0:
                     continue
-
-                # Skip segments with very high no-speech probability
                 if hasattr(seg, 'no_speech_prob') and seg.no_speech_prob > 0.6:
                     continue
 
                 if seg.words:
                     for word in seg.words:
-                        word_start_ms = int(word.start * 1000) + offset_ms
-                        word_end_ms = int(word.end * 1000) + offset_ms
+                        word_start_ms = int(word.start * 1000) + start_ms
+                        word_end_ms = int(word.end * 1000) + start_ms
                         raw_words.append({
                             "text": word.word,
                             "start_ms": word_start_ms,
@@ -585,9 +622,8 @@ class WhisperProvider:
                             "language": lang,
                         })
                 else:
-                    # No word timestamps — emit segment as single token
-                    seg_start_ms = int(seg.start * 1000) + offset_ms
-                    seg_end_ms = int(seg.end * 1000) + offset_ms
+                    seg_start_ms = int(seg.start * 1000) + start_ms
+                    seg_end_ms = int(seg.end * 1000) + start_ms
                     conf = round(float(getattr(seg, "avg_logprob", -0.3) + 1), 3)
                     if conf > MIN_CONFIDENCE:
                         raw_words.append({
@@ -599,49 +635,194 @@ class WhisperProvider:
                         })
 
             if not raw_words:
-                return None
+                raw_words = []
 
-            # ── Repetition detection ──
             raw_words = detect_repetition(raw_words)
 
-            # ── Word consensus finalization ──
-            consensus = state["consensus"]
-            stabilized_words = consensus.update(raw_words)
-
-            if not stabilized_words:
-                return None
-
-            # Convert to Token objects
             tokens = []
-            for w in stabilized_words:
-                tok = Token(
-                    text       = w["text"],
-                    start_ms   = w["start_ms"],
-                    end_ms     = w["end_ms"],
-                    confidence = w["confidence"],
-                    is_final   = w["is_final"],
-                    speaker    = "1",
-                    language   = w["language"],
-                )
-                tokens.append(tok)
-
-            final_cursor = max(
-                (t.end_ms for t in tokens if t.is_final),
-                default=state["final_cursor"]
-            )
-            state["final_cursor"] = max(state["final_cursor"], final_cursor)
+            for fw in finalized_words:
+                tokens.append(Token(
+                    text=fw["text"],
+                    start_ms=fw["start_ms"],
+                    end_ms=fw["end_ms"],
+                    confidence=fw["confidence"],
+                    is_final=True,
+                    speaker="1",
+                    language=fw["language"]
+                ))
+                
+            for w in raw_words:
+                if w["end_ms"] > final_cursor:
+                    tokens.append(Token(
+                        text=w["text"],
+                        start_ms=w["start_ms"],
+                        end_ms=w["end_ms"],
+                        confidence=w["confidence"],
+                        is_final=False,
+                        speaker="1",
+                        language=w["language"]
+                    ))
 
             return TranscriptionResult(
                 tokens              = tokens,
-                audio_offset_ms     = offset_ms,
-                final_audio_proc_ms = state["final_cursor"],
-                total_audio_proc_ms = audio_cursor_ms,
+                audio_offset_ms     = start_ms,
+                final_audio_proc_ms = final_cursor,
+                total_audio_proc_ms = start_ms + int(len(audio) / SAMPLE_RATE * 1000),
             )
 
         except Exception as e:
-            print(f"[Whisper] Transcription error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[Whisper] Fast backend error: {e}")
+            return None
+
+    async def _run_accurate_pass_task(self, session_id: str, audio_cursor_ms: int, task: str, beam_size: int):
+        try:
+            state = self._sessions.get(session_id)
+            if not state or not state["speech_active"]:
+                return
+
+            offset_ms = state["audio_offset"]
+            final_cursor = state["final_cursor"]
+            
+            start_ms = max(offset_ms, final_cursor - OVERLAP_MS)
+            start_sample = int((start_ms - offset_ms) * SAMPLE_RATE / 1000)
+            
+            audio = state["pcm_f32"]
+            if start_sample >= len(audio):
+                return
+                
+            audio_slice = audio[start_sample:].copy()
+            if len(audio_slice) < SAMPLE_RATE * 0.5:  # at least 500ms for accurate pass
+                return
+
+            with self._lock:
+                model = self._model
+            if model is None:
+                return
+
+            prompt_context = state["consensus"].get_prompt_context()
+
+            loop = asyncio.get_event_loop()
+            raw_words = await loop.run_in_executor(
+                None, self._run_whisper_accurate_backend, audio_slice, start_ms, task, beam_size, prompt_context
+            )
+
+            if raw_words is not None:
+                consensus = state["consensus"]
+                stabilized_words = consensus.update(raw_words)
+                
+                tokens = []
+                for w in stabilized_words:
+                    tokens.append(Token(
+                        text       = w["text"],
+                        start_ms   = w["start_ms"],
+                        end_ms     = w["end_ms"],
+                        confidence = w["confidence"],
+                        is_final   = w["is_final"],
+                        speaker    = "1",
+                        language   = w["language"],
+                    ))
+
+                new_final_cursor = max(
+                    (t.end_ms for t in tokens if t.is_final),
+                    default=state["final_cursor"]
+                )
+                state["final_cursor"] = max(state["final_cursor"], new_final_cursor)
+
+                result = TranscriptionResult(
+                    tokens              = tokens,
+                    audio_offset_ms     = offset_ms,
+                    final_audio_proc_ms = state["final_cursor"],
+                    total_audio_proc_ms = audio_cursor_ms,
+                )
+
+                if state["websocket"]:
+                    async with state["send_lock"]:
+                        await state["websocket"].send_text(result.to_json())
+
+        except Exception as e:
+            print(f"[Whisper] Accurate pass error: {e}")
+        finally:
+            state = self._sessions.get(session_id)
+            if state:
+                state["accurate_in_progress"] = False
+
+    def _run_whisper_accurate_backend(
+        self,
+        audio: np.ndarray,
+        start_ms: int,
+        task: str,
+        beam_size: int,
+        prompt_context: str = "",
+    ) -> Optional[list[dict]]:
+        try:
+            with self._lock:
+                model = self._model
+            if model is None:
+                return None
+
+            transcribe_kwargs = dict(
+                language=None,
+                task=task,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": 300,
+                    "speech_pad_ms": 200,
+                    "threshold": 0.35,
+                },
+                beam_size=beam_size,
+                without_timestamps=False,
+                no_speech_threshold=0.5,
+                log_prob_threshold=-0.8,
+                condition_on_previous_text=True,
+                compression_ratio_threshold=2.2,
+            )
+
+            if prompt_context:
+                transcribe_kwargs["initial_prompt"] = prompt_context
+
+            segments, info = model.transcribe(audio, **transcribe_kwargs)
+
+            raw_words = []
+            for seg in segments:
+                lang = info.language if info else "en"
+
+                if hasattr(seg, 'avg_logprob') and seg.avg_logprob < -1.0:
+                    continue
+                if hasattr(seg, 'no_speech_prob') and seg.no_speech_prob > 0.6:
+                    continue
+
+                if seg.words:
+                    for word in seg.words:
+                        word_start_ms = int(word.start * 1000) + start_ms
+                        word_end_ms = int(word.end * 1000) + start_ms
+                        raw_words.append({
+                            "text": word.word,
+                            "start_ms": word_start_ms,
+                            "end_ms": word_end_ms,
+                            "confidence": round(float(word.probability), 3),
+                            "language": lang,
+                        })
+                else:
+                    seg_start_ms = int(seg.start * 1000) + start_ms
+                    seg_end_ms = int(seg.end * 1000) + start_ms
+                    conf = round(float(getattr(seg, "avg_logprob", -0.3) + 1), 3)
+                    if conf > MIN_CONFIDENCE:
+                        raw_words.append({
+                            "text": seg.text,
+                            "start_ms": seg_start_ms,
+                            "end_ms": seg_end_ms,
+                            "confidence": conf,
+                            "language": lang,
+                        })
+
+            if not raw_words:
+                return []
+
+            return detect_repetition(raw_words)
+
+        except Exception as e:
+            print(f"[Whisper] Accurate backend error: {e}")
             return None
 
     async def flush(
@@ -654,7 +835,6 @@ class WhisperProvider:
         """Transcribe any remaining audio and mark all tokens final."""
         state = self._get_session(session_id)
         if len(state["pcm_f32"]) < SAMPLE_RATE * 0.5:
-            # Even if buffer is small, flush any remaining consensus candidates
             consensus = state["consensus"]
             final_words = consensus.force_finalize_all()
             if final_words:
@@ -674,20 +854,22 @@ class WhisperProvider:
                 )
             return None
 
-        with self._lock:
-            model = self._model
-        if model is None:
-            return None
+        offset_ms = state["audio_offset"]
+        final_cursor = state["final_cursor"]
+        start_ms = max(offset_ms, final_cursor - OVERLAP_MS)
+        start_sample = int((start_ms - offset_ms) * SAMPLE_RATE / 1000)
 
+        audio_slice = state["pcm_f32"][start_sample:].copy()
         prompt_context = state["consensus"].get_prompt_context()
 
         loop   = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, self._run_whisper, state["pcm_f32"].copy(), state,
-            audio_cursor_ms, task, beam_size, prompt_context
+        raw_words = await loop.run_in_executor(
+            None, self._run_whisper_accurate_backend, audio_slice, start_ms, task, beam_size, prompt_context
         )
 
-        # Force-finalize everything on flush
+        if raw_words is not None:
+            state["consensus"].update(raw_words)
+
         consensus = state["consensus"]
         final_words = consensus.force_finalize_all()
 
@@ -707,12 +889,7 @@ class WhisperProvider:
                 total_audio_proc_ms=audio_cursor_ms,
             )
 
-        if result:
-            for t in result.tokens:
-                t.is_final = True
-            result.final_audio_proc_ms = audio_cursor_ms
-
-        return result
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -797,15 +974,14 @@ async def transcribe_ws(
             data = await websocket.receive_bytes()
             session.audio_cursor_ms += session.chunk_duration_ms
 
-            result = await provider.process_chunk(
+            await provider.process_chunk(
                 pcm_int16        = data,
                 session_id       = sid,
                 audio_cursor_ms  = session.audio_cursor_ms,
                 task             = task,
                 beam_size        = beam_size,
+                websocket        = websocket,
             )
-            if result:
-                await websocket.send_text(result.to_json())
 
     except WebSocketDisconnect:
         flush = await provider.flush(sid, session.audio_cursor_ms, task=task, beam_size=beam_size)
